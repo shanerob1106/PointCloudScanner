@@ -1,0 +1,111 @@
+#pragma kernel CSCalculateDistances
+#pragma kernel CSFilterOutliers
+
+// Input/Output buffers
+RWStructuredBuffer<float3> pointsBuffer;
+RWStructuredBuffer<float> meanDistancesBuffer;
+RWStructuredBuffer<int> validIndicesBuffer;
+RWStructuredBuffer<int> validCountBuffer;
+
+// Parameters
+int pointCount;
+int k;
+float stdThreshold;
+float globalMean;
+float stdDev;
+
+[numthreads(256, 1, 1)]
+void CSCalculateDistances(uint3 id : SV_DispatchThreadID)
+{
+    uint pointIndex = id.x;
+    if (pointIndex >= (uint)pointCount) return;
+    
+    float3 currentPoint = pointsBuffer[pointIndex];
+    
+    // Dynamic array size based on actual k parameter
+    int actualK = min(k, pointCount - 1);
+    if (actualK <= 0) 
+    {
+        meanDistancesBuffer[pointIndex] = 0.0;
+        return;
+    }
+    
+    // Use a simple approach: collect all distances, then find k smallest
+    // This is more memory-intensive but matches the CPU algorithm exactly
+    
+    // For very large point clouds, we might need to use a different approach
+    // But for typical VR scanning (< 50k points), this should work
+    
+    float minDistances[100]; // Assuming k <= 100, adjust if needed
+    
+    // Initialize with very large values
+    for (int i = 0; i < actualK; i++)
+    {
+        minDistances[i] = 1e20; // Very large number
+    }
+    
+    // Collect distances to all other points and maintain k smallest
+    for (uint j = 0; j < (uint)pointCount; j++)
+    {
+        if (j == pointIndex) continue;
+        
+        float3 otherPoint = pointsBuffer[j];
+        float3 diff = currentPoint - otherPoint;
+        float dist = sqrt(dot(diff, diff)); // Euclidean distance
+        
+        // Insert into sorted array if this distance is smaller than the largest
+        // of our current k smallest distances
+        if (dist < minDistances[actualK - 1])
+        {
+            // Find insertion point
+            int insertPos = actualK - 1;
+            for (int i = 0; i < actualK - 1; i++)
+            {
+                if (dist < minDistances[i])
+                {
+                    insertPos = i;
+                    break;
+                }
+            }
+            
+            // Shift elements to make room
+            for (int i = actualK - 1; i > insertPos; i--)
+            {
+                minDistances[i] = minDistances[i - 1];
+            }
+            
+            // Insert the new distance
+            minDistances[insertPos] = dist;
+        }
+    }
+    
+    // Calculate mean of k nearest neighbor distances
+    float sum = 0.0;
+    for (int i = 0; i < actualK; i++)
+    {
+        sum += minDistances[i];
+    }
+    
+    meanDistancesBuffer[pointIndex] = sum / (float)actualK;
+}
+
+[numthreads(256, 1, 1)]
+void CSFilterOutliers(uint3 id : SV_DispatchThreadID)
+{
+    uint pointIndex = id.x;
+    if (pointIndex >= (uint)pointCount) return;
+    
+    float meanDistance = meanDistancesBuffer[pointIndex];
+    float threshold = globalMean + stdThreshold * stdDev;
+    
+    // Keep points that are NOT outliers (distance <= threshold)
+    if (meanDistance <= threshold)
+    {
+        // Atomically increment counter and get the previous value
+        int originalCount;
+        InterlockedAdd(validCountBuffer[0], 1, originalCount);
+        
+        // Store the valid point index
+        validIndicesBuffer[originalCount] = (int)pointIndex;
+    }
+}
